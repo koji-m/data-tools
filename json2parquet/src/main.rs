@@ -1,22 +1,33 @@
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::json::reader::{DecoderOptions, Reader};
-use arrow::record_batch::RecordBatch;
+use arrow::{
+    datatypes::{DataType, Field, Schema},
+    json::reader::{DecoderOptions, Reader},
+    record_batch::RecordBatch,
+};
 use aws_config::meta::region::RegionProviderChain;
-use aws_sdk_s3::types::ByteStream;
-use aws_sdk_s3::{Client, Region};
-use clap::{App, Arg};
-use parquet::arrow::arrow_writer::ArrowWriter;
-use parquet::file::properties::WriterProperties;
-use parquet::file::writer::{InMemoryWriteableCursor, TryClone};
+use aws_sdk_s3::{
+    types::ByteStream,
+    {Client, Region}
+};
+use clap::{Command, Arg};
+use parquet::{
+    arrow::arrow_writer::ArrowWriter,
+    basic::Compression,
+    file::{
+        properties::WriterProperties,
+        writer::{InMemoryWriteableCursor, TryClone},
+    }
+};
 use serde::{Deserialize, Serialize};
-use std::error::Error;
-use std::fmt;
-use std::fs::File;
-use std::io;
-use std::io::BufReader;
-use std::path::Path;
-use std::result::Result;
-use std::sync::Arc;
+use std::{
+    error::Error,
+    fmt,
+    fs::File,
+    io,
+    io::BufReader,
+    path::Path,
+    result::Result,
+    sync::Arc,
+};
 
 #[derive(Serialize, Deserialize)]
 struct BigQueryColumnDefinition {
@@ -108,35 +119,58 @@ async fn upload_to_s3(cursor: InMemoryWriteableCursor, bucket: &str, key_prefix:
 
 #[tokio::main]
 async fn main() {
-    let args = App::new("json2parquet")
+    let args = Command::new("json2parquet")
         .version("0.0.1")
         .about("transform JSON to Parquet")
-        .arg(Arg::with_name("schema-file")
+        .arg(Arg::new("schema-file")
             .help("Schema file (BigQuery schema)")
+            .long("schema")
             .takes_value(true)
             .required(true))
-        .arg(Arg::with_name("s3-bucket")
+        .arg(Arg::new("s3-bucket")
             .help("S3 bucket name")
+            .long("s3-bucket")
             .takes_value(true)
             .required(true))
-        .arg(Arg::with_name("key-prefix")
+        .arg(Arg::new("key-prefix")
             .help("S3 key prefix")
+            .long("key-prefix")
+            .takes_value(true)
+            .required(true))
+        .arg(Arg::new("batch-size")
+            .help("number of records in each files")
+            .long("batch-size")
+            .takes_value(true)
+            .default_value("10000"))
+        .arg(Arg::new("input-file")
+            .help("input file path or '-' for stdin")
             .takes_value(true)
             .required(true))
         .get_matches();
     let schema_file_path = args.value_of("schema-file").unwrap();
     let bucket = args.value_of("s3-bucket").unwrap();
     let key_prefix = args.value_of("key-prefix").unwrap();
+    let batch_size: usize = args.value_of_t("batch-size").expect("batch-size must be number");
+    let input_file = args.value_of("input-file").unwrap();
 
-    let stdin = io::stdin();
-    let reader = stdin.lock();
+    
     let schema = get_schema(schema_file_path).unwrap();
-    let options = DecoderOptions::new();
-    let json_reader = Reader::new(reader, Arc::new(schema), options);
-    let client = get_s3_client().await.unwrap();    
-    let properties = WriterProperties::builder().build();
-    for (i, batch_) in json_reader.enumerate() {
-        let cursor = write_parquet_to_memory(batch_.unwrap(), properties.clone());
-        upload_to_s3(cursor, bucket, key_prefix, i, &client).await;
-    }
+    let options = DecoderOptions::new().with_batch_size(batch_size);
+    let client = get_s3_client().await.unwrap();
+    let properties = WriterProperties::builder().set_compression(Compression::SNAPPY).build();
+    if input_file == "-" {
+        let stdin = io::stdin();
+        let json_reader = Reader::new(stdin.lock(), Arc::new(schema), options);
+        for (i, batch_) in json_reader.enumerate() {
+            let cursor = write_parquet_to_memory(batch_.unwrap(), properties.clone());
+            upload_to_s3(cursor, bucket, key_prefix, i, &client).await;
+        }
+    } else {
+        let file = File::open(input_file).unwrap();
+        let json_reader = Reader::new(BufReader::new(file), Arc::new(schema), options);
+        for (i, batch_) in json_reader.enumerate() {
+            let cursor = write_parquet_to_memory(batch_.unwrap(), properties.clone());
+            upload_to_s3(cursor, bucket, key_prefix, i, &client).await;
+        }
+    };
 }
