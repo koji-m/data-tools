@@ -1,6 +1,8 @@
+mod extract_json;
+
 use arrow::{
     datatypes::{DataType, Field, Schema},
-    json::reader::{DecoderOptions, Reader},
+    json::reader::DecoderOptions,
     record_batch::RecordBatch,
 };
 use aws_config::meta::region::RegionProviderChain;
@@ -9,6 +11,7 @@ use aws_sdk_s3::{
     {Client, Region}
 };
 use clap::{Command, Arg};
+use extract_json::reader;
 use parquet::{
     arrow::arrow_writer::ArrowWriter,
     basic::Compression,
@@ -26,7 +29,6 @@ use std::{
     io::BufReader,
     path::Path,
     result::Result,
-    sync::Arc,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -160,14 +162,14 @@ async fn main() {
     let properties = WriterProperties::builder().set_compression(Compression::SNAPPY).build();
     if input_file == "-" {
         let stdin = io::stdin();
-        let json_reader = Reader::new(stdin.lock(), Arc::new(schema), options);
+        let json_reader = reader(stdin.lock(), schema, options).unwrap();
         for (i, batch_) in json_reader.enumerate() {
             let cursor = write_parquet_to_memory(batch_.unwrap(), properties.clone());
             upload_to_s3(cursor, bucket, key_prefix, i, &client).await;
         }
     } else {
         let file = File::open(input_file).unwrap();
-        let json_reader = Reader::new(BufReader::new(file), Arc::new(schema), options);
+        let json_reader = reader(BufReader::new(file), schema, options).unwrap();
         for (i, batch_) in json_reader.enumerate() {
             let cursor = write_parquet_to_memory(batch_.unwrap(), properties.clone());
             upload_to_s3(cursor, bucket, key_prefix, i, &client).await;
