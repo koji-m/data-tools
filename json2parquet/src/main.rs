@@ -1,23 +1,20 @@
-mod extract_json;
+mod extracter_file;
+mod reader_json;
+mod loader_s3;
+mod writer_parquet;
 
 use arrow::{
     datatypes::{DataType, Field, Schema},
     json::reader::DecoderOptions,
-    record_batch::RecordBatch,
-};
-use aws_config::meta::region::RegionProviderChain;
-use aws_sdk_s3::{
-    types::ByteStream,
-    {Client, Region}
 };
 use clap::{Command, Arg};
-use extract_json::reader;
+use extracter_file::Extracter;
+use reader_json::Reader;
+use loader_s3::Loader;
 use parquet::{
-    arrow::arrow_writer::ArrowWriter,
     basic::Compression,
     file::{
         properties::WriterProperties,
-        writer::{InMemoryWriteableCursor, TryClone},
     }
 };
 use serde::{Deserialize, Serialize};
@@ -30,6 +27,7 @@ use std::{
     path::Path,
     result::Result,
 };
+use writer_parquet::Writer;
 
 #[derive(Serialize, Deserialize)]
 struct BigQueryColumnDefinition {
@@ -84,41 +82,6 @@ fn get_schema<P: AsRef<Path>>(path: P) -> Result<Schema, Box<dyn Error>>  {
     Ok(Schema::new(column_definitions))
 }
 
-async fn get_s3_client() -> Option<Client> {
-    let region_provider = RegionProviderChain::default_provider()
-        .or_else(Region::new("us-east-1"));
-    let config = aws_config::from_env().region(region_provider).load().await;
-    Some(Client::new(&config))
-}
-
-fn write_parquet_to_memory(batch: RecordBatch, properties: WriterProperties) -> InMemoryWriteableCursor {
-    let cursor = InMemoryWriteableCursor::default();
-    let mut writer = ArrowWriter::try_new(
-        cursor.try_clone().unwrap(),
-        batch.schema(),
-        Some(properties)
-    ).unwrap();
-    writer.write(&batch).expect("Writing batch");
-    writer.close().unwrap();
-    cursor
-}
-
-async fn upload_to_s3(cursor: InMemoryWriteableCursor, bucket: &str, key_prefix: &str, suffix: usize, client: &Client) {
-    let stream = ByteStream::from(cursor.into_inner().unwrap());
-    let file = format!("{}{}.parquet", key_prefix, suffix);
-    let resp = client
-        .put_object()
-        .bucket(bucket)
-        .key(&file)
-        .body(stream)
-        .send()
-        .await;
-    match resp {
-        Ok(_) => println!("Wrote s3://{}/{}", bucket, file),
-        Err(_) => println!("Error write s3://{}/{}", bucket, file),
-    }
-}
-
 #[tokio::main]
 async fn main() {
     let args = Command::new("json2parquet")
@@ -158,21 +121,24 @@ async fn main() {
     
     let schema = get_schema(schema_file_path).unwrap();
     let options = DecoderOptions::new().with_batch_size(batch_size);
-    let client = get_s3_client().await.unwrap();
     let properties = WriterProperties::builder().set_compression(Compression::SNAPPY).build();
+    let loader = Loader::new(&bucket, &key_prefix).await;
+    let writer = Writer::new(properties);
     if input_file == "-" {
         let stdin = io::stdin();
-        let json_reader = reader(stdin.lock(), schema, options).unwrap();
-        for (i, batch_) in json_reader.enumerate() {
-            let cursor = write_parquet_to_memory(batch_.unwrap(), properties.clone());
-            upload_to_s3(cursor, bucket, key_prefix, i, &client).await;
+        let mut extracter = Extracter::new(stdin.lock());
+        let batch_reader = Reader::new(extracter.into_inner(), schema, options);
+        for (i, batch_) in batch_reader.enumerate() {
+            let cursor = writer.write(batch_.unwrap());
+            loader.load(cursor.into_inner().unwrap(), i).await;
         }
     } else {
         let file = File::open(input_file).unwrap();
-        let json_reader = reader(BufReader::new(file), schema, options).unwrap();
-        for (i, batch_) in json_reader.enumerate() {
-            let cursor = write_parquet_to_memory(batch_.unwrap(), properties.clone());
-            upload_to_s3(cursor, bucket, key_prefix, i, &client).await;
+        let mut extracter = Extracter::new(BufReader::new(file));
+        let batch_reader = Reader::new(extracter.into_inner(), schema, options);
+        for (i, batch_) in batch_reader.enumerate() {
+            let cursor = writer.write(batch_.unwrap());
+            loader.load(cursor.into_inner().unwrap(), i).await;
         }
     };
 }

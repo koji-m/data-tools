@@ -1,13 +1,12 @@
 use arrow::{
     datatypes::Schema,
-    json::reader::{DecoderOptions, Reader},
+    json,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
     fmt,
     io::Read,
-    result::Result,
     sync::Arc,
 };
 
@@ -35,6 +34,10 @@ impl Error for UnknownTypeError {
     }
 }
 
-pub fn reader<R: Read>(input_file: R, schema: Schema, options: DecoderOptions) -> Result<Reader<R>, Box<dyn Error>> {
-        return Ok(Reader::new(input_file, Arc::new(schema), options));
+pub struct Reader();
+
+impl Reader {
+    pub fn new<R: Read>(input_file: R, schema: Schema, options: json::reader::DecoderOptions) -> json::reader::Reader<R> {
+            json::reader::Reader::new(input_file, Arc::new(schema), options)
+    }
 }
